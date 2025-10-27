@@ -1,0 +1,12 @@
+/dataset/**
+**/.ipynb_checkpoints/**
+**/__pycache__/**
+/eval_scripts/**
+/exp_scripts/**
+/outputs/**
+/wandb/**
+/train_results/**
+/dataset/train_data/**
+/dataset/test_data/**
+/eval_scripts/private/**
+/logs/**
