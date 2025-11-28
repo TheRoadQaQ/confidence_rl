@@ -476,7 +476,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                         if "response_mask" not in new_batch.batch:
                             new_batch.batch["response_mask"] = compute_response_mask(new_batch)
 
-                        breakpoint()
+                        #breakpoint()
 
                         # Apply Lagrangian constraints if enabled
                         if self.use_constraints and self.constraint_manager is not None:

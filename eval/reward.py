@@ -17,7 +17,11 @@ def confidence_extractor(response, **kwargs):
     if last_confidence == "":
         return -1, -1
     else:
-        confidence = float(last_confidence)
+        try:
+            confidence = float(last_confidence)
+        except ValueError:
+            return -1,-1
+            
         if confidence >= 0 and confidence <= 1:
             return 1, confidence
         else:
@@ -72,10 +76,11 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
     # Get all <answer>...</answer> occurrences
     ans_matches = re.findall(answer_pattern, solution_str, re.DOTALL | re.MULTILINE)
     
+    
     # Format Error
     if len(conf_matches) == 0 or len(ans_matches) == 0:
         return {
-            "score": -1.0,
+            "score": -2.0,
             "acc": -1.0,
             "confidence": -1.0
         }
@@ -85,6 +90,13 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
     # 返回 (格式遵循标志, 置信度水平)
     # 我们只关心置信度水平
     _conf_format, confidence = confidence_extractor(solution_str)
+
+    if _conf_format == -1:
+        return {
+            "score": -2.0,
+            "acc": -1.0,
+            "confidence": -1.0
+        }
 
     # 2. 评估正确性 (Accuracy / Score)
     # gen_correctness_reward 期望特定的列表格式

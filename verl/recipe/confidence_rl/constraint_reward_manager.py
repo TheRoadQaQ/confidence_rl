@@ -82,7 +82,7 @@ class CalashRewardManager:
         - Lambda update: $\lambda = \text{clip}(\lambda + \eta_\lambda \cdot g, \lambda_{min}, \lambda_{max})$
         """
         # 1. Get rewards
-        rewards = batch.batch.get("token_level_scores", batch.batch.get("token_level_rewards"))
+        rewards = batch.batch["token_level_scores"]
 
         # Clone to avoid in-place modification
         reward_tensor = rewards.clone()
