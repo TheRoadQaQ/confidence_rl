@@ -85,6 +85,7 @@ class CalashRewardManager:
         # 1. Get rewards and masks
         rewards = batch.batch["token_level_scores"]
         response_mask = batch.batch["response_mask"]
+        format_tensor = batch.batch["format_tensor"]
         confidence_tensor = batch.batch["confidence_tensor"] # Shape: (batch_size,)
 
         # Clone to avoid in-place modification
@@ -109,7 +110,7 @@ class CalashRewardManager:
             r_task = rewards[i, last_token_idx].item()
 
             # Check if the format is correct (i.e., not a format penalty)
-            if r_task != FORMAT_PENALTY:
+            if format_tensor[i]:
                 # --- 3a. Format is correct: Apply CALASH logic ---
                 
                 # Get task reward and confidence

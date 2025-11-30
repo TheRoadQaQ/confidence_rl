@@ -6,6 +6,7 @@ def confidence_extractor(response, **kwargs):
     """Extracts the confidence from the completions
     If a float is found within confidence tags, it is processed as follows:
     If the float is between 0 and 1, it is returned as is.
+    If the float is between 1 and 100, it is divided by 100 and returned.
     If float is not directly found, the first number in the string is extracted and processed as above.
     If no float is found, 0 is returned.    
     """
@@ -15,17 +16,29 @@ def confidence_extractor(response, **kwargs):
     # Get the last confidence, if exists
     last_confidence = conf_matches[-1] if conf_matches else ""
     if last_confidence == "":
-        return -1, -1
+        return 0, 0.0
     else:
         try:
             confidence = float(last_confidence)
-        except ValueError:
-            return -1,-1
-            
-        if confidence >= 0 and confidence <= 1:
-            return 1, confidence
-        else:
-            return -1, -1
+            if confidence > 1 and confidence <= 100:
+                return 1, confidence/100
+            elif confidence >= 0 and confidence <= 1:
+                return 1, confidence
+            else:
+                return 0, 0.0
+        except:
+            # extract the first number in the string
+            first_number = re.search(r'-?\d+(?:\.\d+)?', last_confidence)
+            if first_number:
+                first_number = float(first_number.group())
+                if first_number >= 0 and first_number <= 1:
+                    return 1, first_number
+                elif first_number > 1 and first_number <= 100:
+                    return 1, first_number/100
+                else:
+                    return 0, 0.0
+            else:
+                return 0, 0.0
 
 def gen_correctness_reward(completions, answer, **kwargs):
     """Reward function that checks if the answer is correct or not
@@ -81,7 +94,8 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
         return {
             "score": FORMAT_PENALTY,
             "acc": 0,
-            "confidence": 1
+            "confidence": 1,
+            "format": 0
         }
     
     # 1. 提取置信度 (Confidence)
@@ -90,11 +104,12 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
     # 我们只关心置信度水平
     _conf_format, confidence = confidence_extractor(solution_str)
 
-    if _conf_format == -1:
+    if _conf_format == 0:
         return {
             "score": FORMAT_PENALTY,
             "acc": 0,
-            "confidence": 1
+            "confidence": 1,
+            "foramt": 0
         }
 
     # 2. 评估正确性 (Accuracy / Score)
@@ -122,5 +137,6 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
     return {
         "score": score,
         "acc": acc,
-        "confidence": confidence
+        "confidence": confidence,
+        "format": 1
     }
