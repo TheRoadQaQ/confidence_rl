@@ -109,7 +109,7 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
             "score": FORMAT_PENALTY,
             "acc": 0,
             "confidence": 1,
-            "foramt": 0
+            "format": 0
         }
 
     # 2. 评估正确性 (Accuracy / Score)
