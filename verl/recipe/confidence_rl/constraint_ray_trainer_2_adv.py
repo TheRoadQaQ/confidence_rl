@@ -46,7 +46,7 @@ def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std
         
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["brier_tensor"].unsqueeze(-1),
+            token_level_rewards=data.batch["brier_reward_tensor"].unsqueeze(-1),
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
@@ -147,19 +147,16 @@ class RayConstraintTrainer(RayPPOTrainer):
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * len(reward_acc)))
             format_lst.append(format_scores_batch)
         
-        
         print('Validation: Generation end.')
         
         reward_acc = np.concatenate(reward_acc_lst, axis=0) # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         lengths = np.concatenate(length_lst, axis=0)
         confidences = np.concatenate(confidence_lst, axis=0)
+
         # 🌟 合并 Brier score 项
         brier_scores = np.concatenate(brier_score_lst, axis=0) 
         format_scores = np.concatenate(format_lst, axis=0) # 0 或 1
-        
-        # 获取格式正确的样本索引 (format_mask)
-        format_mask = (format_scores == 1)
         
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -187,25 +184,22 @@ class RayConstraintTrainer(RayPPOTrainer):
                 data_source_format_scores[data_source] = []
             data_source_format_scores[data_source].append(format_scores[i])
     
-            # 🌟 仅收集格式正确的样本的置信度/Brier Score
-            if format_scores[i] == 1:
-                # 置信度
-                if data_source not in data_source_confidence:
-                    data_source_confidence[data_source] = []
-                data_source_confidence[data_source].append(confidences[i])
-                
-                # 🌟 Brier Score
-                if data_source not in data_source_brier_scores:
-                    data_source_brier_scores[data_source] = []
-                data_source_brier_scores[data_source].append(brier_scores[i])
+            if data_source not in data_source_confidence:
+                data_source_confidence[data_source] = []
+            data_source_confidence[data_source].append(confidences[i])
+            
+            # 🌟 Brier Score
+            if data_source not in data_source_brier_scores:
+                data_source_brier_scores[data_source] = []
+            data_source_brier_scores[data_source].append(brier_scores[i])
         
         
         metric_dict = {}
         test_score_vals = []
         test_length_vals = []
         # 🌟 仅格式正确的置信度/Brier Score
-        test_confidence_vals_format_correct = []
-        test_brier_score_vals_format_correct = [] 
+        test_confidence_vals = []
+        test_brier_score_vals  = [] 
         # 🌟 格式准确率
         test_format_acc_vals = []
         
@@ -223,15 +217,15 @@ class RayConstraintTrainer(RayPPOTrainer):
         for data_source, confidence in data_source_confidence.items():
             # 这里只包含 format=1 的样本，计算平均值
             mean_confidence = np.mean(confidence) if len(confidence) > 0 else 0 
-            metric_dict[f'val/test_confidence_format_correct/{data_source}'] = mean_confidence
-            test_confidence_vals_format_correct.append(mean_confidence)
+            metric_dict[f'val/test_confidence/{data_source}'] = mean_confidence
+            test_confidence_vals.append(mean_confidence)
         
         # 🌟 计算并添加按数据源分组的格式正确样本的平均 Brier Score
         for data_source, brier_terms in data_source_brier_scores.items():
             # 这里只包含 format=1 的样本，计算平均值
             mean_brier = np.mean(brier_terms) if len(brier_terms) > 0 else 0 
-            metric_dict[f'val/test_brier_score_format_correct/{data_source}'] = mean_brier
-            test_brier_score_vals_format_correct.append(mean_brier)
+            metric_dict[f'val/test_brier_score/{data_source}'] = mean_brier
+            test_brier_score_vals.append(mean_brier)
     
         for data_source, lengths in data_source_response_lengths.items():
             metric_dict[f'val/test_length/{data_source}'] = np.mean(lengths)
@@ -245,13 +239,11 @@ class RayConstraintTrainer(RayPPOTrainer):
         # 🌟 总体格式准确率
         metric_dict['result/avg_format_acc'] = np.mean(test_format_acc_vals)
     
-        # 🌟 仅格式正确的样本的总体平均置信度/Brier Score
-        # 使用 format_mask 过滤后的样本计算总体平均值
-        confidences_format_correct = confidences[format_mask]
-        brier_scores_format_correct = brier_scores[format_mask]
+        metric_dict['result/avg_confidence'] = np.mean(confidences)
+        metric_dict['result/avg_brier_score'] = np.mean(brier_scores)
         
-        metric_dict['result/avg_confidence_format_correct'] = np.mean(confidences_format_correct) if len(confidences_format_correct) > 0 else 0
-        metric_dict['result/avg_brier_score_format_correct'] = np.mean(brier_scores_format_correct) if len(brier_scores_format_correct) > 0 else 0
+        metric_dict['result/avg_confidence'] = np.mean(test_confidence_vals)
+        metric_dict['result/avg_brier_score'] = np.mean(test_brier_score_vals)
           
         return metric_dict
 
@@ -613,8 +605,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
 
                         # compute brier score
-                        new_batch.batch["brier_tensor"] =  -1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
-
+                        new_batch.batch["brier_reward_tensor"] =  1 - 1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
@@ -701,6 +692,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                             batch = batch[:traj_bsz]
 
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
+                    metrics.update({"brier/mean": batch.batch['brier_reward_tensor'].mean().item()})
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:
