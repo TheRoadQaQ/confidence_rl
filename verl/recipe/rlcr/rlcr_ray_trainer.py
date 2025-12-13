@@ -40,6 +40,71 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
+from sklearn.metrics import roc_auc_score
+
+def compute_auroc(y_true, y_score):
+    """
+    Compute Area under ROC curve (AUROC).
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        
+    Returns:
+        AUROC score, or 0.0 if computation fails (e.g., only one class present)
+    """
+    try:
+        # Check if we have both classes
+        if len(np.unique(y_true)) < 2:
+            return 0.0
+        return roc_auc_score(y_true, y_score)
+    except Exception:
+        return 0.0
+
+def compute_ece(y_true, y_score, n_bins=10):
+    """
+    Compute Expected Calibration Error (ECE).
+    
+    ECE = sum(|Bm|/N * |acc(Bm) - conf(Bm)|)
+    where M is the number of bins, Bm is the set of samples in bin m, and N is the number of samples.
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        n_bins: Number of bins (default: 10)
+        
+    Returns:
+        ECE score
+    """
+    if len(y_true) == 0:
+        return 0.0
+    
+    # Bin the predictions
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
+    
+    ece = 0.0
+    n = len(y_true)
+    
+    for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+        # Find samples in this bin
+        # For the first bin, include the lower boundary (0)
+        if bin_lower == 0:
+            in_bin = (y_score >= bin_lower) & (y_score <= bin_upper)
+        else:
+            in_bin = (y_score > bin_lower) & (y_score <= bin_upper)
+        prop = np.mean(in_bin)
+        
+        if prop > 0:
+            # Accuracy in this bin
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            # Average confidence in this bin
+            avg_confidence_in_bin = np.mean(y_score[in_bin])
+            # Add to ECE
+            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop
+    
+    return ece
 
 class RayRLCRTrainer(RayPPOTrainer):
     """
@@ -64,15 +129,16 @@ class RayRLCRTrainer(RayPPOTrainer):
         length_lst = []
         confidence_lst = []
         brier_score_lst = [] 
-        format_lst = [] # 0/1, 0: 错, 1: 对
+        format_lst = [] # 0/1, 0: incorrect, 1: correct
         
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            # test_batch = test_batch.to('cuda')
         
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
-            
+        
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
@@ -83,21 +149,21 @@ class RayRLCRTrainer(RayPPOTrainer):
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
-            
+        
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            
+        
             test_batch = test_batch.union(test_output_gen_batch)
             # evaluate using reward_function
+            # for certain reward function (e.g. sandbox), the generation can overlap with reward
             reward_result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_acc = reward_result["reward_extra_info"]["acc"]  # 真实标签 y, 假设为 0 或 1
-            confidence = reward_result["reward_extra_info"]["confidence"] # 预测概率 p
-            format_scores_batch = reward_result["reward_extra_info"]["format"] # 格式，0 或 1
+            reward_acc = reward_result["reward_extra_info"]["acc"]  # True label y, assumed to be 0 or 1
+            confidence = reward_result["reward_extra_info"]["confidence"] # Predicted probability p
+            format_scores_batch = reward_result["reward_extra_info"]["format"] # Format, 0 or 1
         
-            # Brier Score 计算： (p - y)^2
             brier_scores = (np.array(confidence) - np.array(reward_acc))**2 
             
             # obtain response length
@@ -113,18 +179,15 @@ class RayRLCRTrainer(RayPPOTrainer):
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * len(reward_acc)))
             format_lst.append(format_scores_batch)
         
-        
         print('Validation: Generation end.')
         
         reward_acc = np.concatenate(reward_acc_lst, axis=0) # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         lengths = np.concatenate(length_lst, axis=0)
         confidences = np.concatenate(confidence_lst, axis=0)
+
         brier_scores = np.concatenate(brier_score_lst, axis=0) 
-        format_scores = np.concatenate(format_lst, axis=0) # 0 或 1
-        
-        # 获取格式正确的样本索引 (format_mask)
-        format_mask = (format_scores == 1)
+        format_scores = np.concatenate(format_lst, axis=0) # 0 or 1
         
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -136,255 +199,91 @@ class RayRLCRTrainer(RayPPOTrainer):
         for i in range(len(reward_acc)):
             data_source = data_sources[i]
             
-            # 准确率
+            # Accuracy
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_acc[i])
     
-            # 长度
+            # Length
             if data_source not in data_source_response_lengths:
                 data_source_response_lengths[data_source] = []
             data_source_response_lengths[data_source].append(lengths[i])
     
-            # 格式分数
             if data_source not in data_source_format_scores:
                 data_source_format_scores[data_source] = []
             data_source_format_scores[data_source].append(format_scores[i])
     
-            # 仅收集格式正确的样本的置信度/Brier Score
-            if format_scores[i] == 1:
-                # 置信度
-                if data_source not in data_source_confidence:
-                    data_source_confidence[data_source] = []
-                data_source_confidence[data_source].append(confidences[i])
-                
-                # Brier Score
-                if data_source not in data_source_brier_scores:
-                    data_source_brier_scores[data_source] = []
-                data_source_brier_scores[data_source].append(brier_scores[i])
+            if data_source not in data_source_confidence:
+                data_source_confidence[data_source] = []
+            data_source_confidence[data_source].append(confidences[i])
+            
+            if data_source not in data_source_brier_scores:
+                data_source_brier_scores[data_source] = []
+            data_source_brier_scores[data_source].append(brier_scores[i])
         
         
         metric_dict = {}
         test_score_vals = []
         test_length_vals = []
-        test_confidence_vals_format_correct = []
-        test_brier_score_vals_format_correct = [] 
+        test_confidence_vals = []
+        test_brier_score_vals  = [] 
         test_format_acc_vals = []
+        test_auroc_vals = []
+        test_ece_vals = []
         
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
             test_score_vals.append(np.mean(rewards))
     
-        # 计算并添加按数据源分组的格式准确率
         for data_source, formats in data_source_format_scores.items():
             format_acc = np.mean(formats)
             metric_dict[f'val/format_acc/{data_source}'] = format_acc
             test_format_acc_vals.append(format_acc)
     
-        # 计算并添加按数据源分组的格式正确样本的平均置信度
         for data_source, confidence in data_source_confidence.items():
+            # Only includes samples with format=1, calculate mean
             mean_confidence = np.mean(confidence) if len(confidence) > 0 else 0 
-            metric_dict[f'val/test_confidence_format_correct/{data_source}'] = mean_confidence
-            test_confidence_vals_format_correct.append(mean_confidence)
+            metric_dict[f'val/test_confidence/{data_source}'] = mean_confidence
+            test_confidence_vals.append(mean_confidence)
         
-        # 计算并添加按数据源分组的格式正确样本的平均 Brier Score
         for data_source, brier_terms in data_source_brier_scores.items():
+            # Only includes samples with format=1, calculate mean
             mean_brier = np.mean(brier_terms) if len(brier_terms) > 0 else 0 
-            metric_dict[f'val/test_brier_score_format_correct/{data_source}'] = mean_brier
-            test_brier_score_vals_format_correct.append(mean_brier)
+            metric_dict[f'val/test_brier_score/{data_source}'] = mean_brier
+            test_brier_score_vals.append(mean_brier)
     
         for data_source, lengths in data_source_response_lengths.items():
             metric_dict[f'val/test_length/{data_source}'] = np.mean(lengths)
             test_length_vals.append(np.mean(lengths))
         
-        # 总结指标
+        # Compute AUROC and ECE for each data source
+        for data_source in data_source_reward.keys():
+            # Get corresponding rewards (acc) and confidences for this data source
+            acc_values = np.array(data_source_reward[data_source])
+            conf_values = np.array(data_source_confidence[data_source])
+            
+            # Compute AUROC
+            auroc = compute_auroc(acc_values, conf_values)
+            metric_dict[f'val/confidence_metrics/auroc/{data_source}'] = auroc
+            test_auroc_vals.append(auroc)
+            
+            # Compute ECE
+            ece = compute_ece(acc_values, conf_values, n_bins=10)
+            metric_dict[f'val/confidence_metrics/ece/{data_source}'] = ece
+            test_ece_vals.append(ece)
+       
         metric_dict['result/avg_acc'] = np.mean(test_score_vals)
         metric_dict['result/avg_len'] = np.mean(test_length_vals)
         
-        # 总体格式准确率
         metric_dict['result/avg_format_acc'] = np.mean(test_format_acc_vals)
     
-        # 仅格式正确的样本的总体平均置信度/Brier Score
-        confidences_format_correct = confidences[format_mask]
-        brier_scores_format_correct = brier_scores[format_mask]
-        
-        metric_dict['result/avg_confidence_format_correct'] = np.mean(confidences_format_correct) if len(confidences_format_correct) > 0 else 0
-        metric_dict['result/avg_brier_score_format_correct'] = np.mean(brier_scores_format_correct) if len(brier_scores_format_correct) > 0 else 0
+        metric_dict['result/avg_confidence'] = np.mean(test_confidence_vals)
+        metric_dict['result/avg_brier_score'] = np.mean(test_brier_score_vals)
+        metric_dict['result/avg_auroc'] = np.mean(test_auroc_vals) if len(test_auroc_vals) > 0 else 0.0
+        metric_dict['result/avg_ece'] = np.mean(test_ece_vals) if len(test_ece_vals) > 0 else 0.0
           
         return metric_dict
 
-    def _validate_with_save(self, output_path):
-        """
-        执行验证，并按 question_id 保存每个样本的多个生成响应及其准确率。
-        指标计算将按 data_source 分组。
-        支持 resume 功能：如果输出文件已存在，将跳过已处理的 question_ids。
-        """
-        print("Validation with Save: Generation Begin.")
-
-        results_by_question = {}
-        processed_qids = set()
-
-        # 检查输出文件是否存在，如果存在则读取已处理的 question_ids
-        if os.path.exists(output_path):
-            print(f"Found existing results file: {output_path}")
-            print("Loading processed question_ids for resume...")
-            with open(output_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line.strip())
-                        qid = data["question_id"]
-                        processed_qids.add(qid)
-                        results_by_question[qid] = {
-                            "data_source": data["data_source"],
-                            "responses": data["responses"]
-                        }
-                    except json.JSONDecodeError:
-                        continue
-            print(f"Found {len(processed_qids)} already processed question_ids.")
-
-        # Calculate total samples for progress bar
-        total_samples = 0
-        skipped_samples = 0
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-            if 'question_id' in test_batch.non_tensor_batch:
-                batch_qids = test_batch.non_tensor_batch.get('question_id')
-                unprocessed_in_batch = sum(1 for qid in batch_qids if qid not in processed_qids)
-                total_samples += unprocessed_in_batch
-                skipped_samples += len(batch_qids) - unprocessed_in_batch
-            else:
-                total_samples += len(test_batch)
-
-        print(f"Total samples to process: {total_samples} (skipping {skipped_samples} already processed)")
-
-        pbar = tqdm(total=total_samples, desc="Validating samples")
-
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
-                print("Skipping validation for model-based reward model.")
-                continue
-
-            # 检查 batch 中的 question_ids，过滤出需要处理的样本
-            if 'question_id' in test_batch.non_tensor_batch:
-                batch_qids = test_batch.non_tensor_batch.get('question_id')
-                indices_to_process = [i for i, qid in enumerate(batch_qids) if qid not in processed_qids]
-
-                if not indices_to_process:
-                    continue
-
-                test_batch = test_batch[indices_to_process]
-
-            n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
-            repeated_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-
-            gen_batch = repeated_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-            }
-
-            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_wg.world_size)
-            output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
-            output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
-
-            final_batch = repeated_batch.union(output_gen_batch)
-
-            reward_result = self.val_reward_fn(final_batch, return_dict=True)
-            accuracies = reward_result["reward_extra_info"]["acc"]
-
-            question_ids = final_batch.non_tensor_batch.get('question_id')
-            data_sources = final_batch.non_tensor_batch.get('data_source', ['unknown'] * len(question_ids))
-
-            response_ids = output_gen_batch.batch['responses']
-
-            prompt_length = output_gen_batch.batch['prompts'].shape[-1]
-            response_lengths = output_gen_batch.batch['attention_mask'][:, prompt_length:].sum(1).numpy()
-
-            new_results_for_save = {}
-
-            for i in range(len(question_ids)):
-                qid = question_ids[i]
-                source = data_sources[i]
-                acc = accuracies[i]
-                token_length = int(response_lengths[i])
-
-                response_text = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
-
-                if qid not in results_by_question:
-                    results_by_question[qid] = {
-                        "data_source": source,
-                        "responses": []
-                    }
-                    new_results_for_save[qid] = {
-                        "data_source": source,
-                        "responses": []
-                    }
-
-                results_by_question[qid]["responses"].append({
-                    "response": response_text.strip(),
-                    "acc": float(acc),
-                    "tokens": token_length
-                })
-
-                if qid in new_results_for_save:
-                    new_results_for_save[qid]["responses"].append({
-                        "response": response_text.strip(),
-                        "acc": float(acc),
-                        "tokens": token_length
-                    })
-
-            # 实时追加新结果到文件
-            if new_results_for_save:
-                with open(output_path, 'a', encoding='utf-8') as f:
-                    for qid, data in new_results_for_save.items():
-                        json_line = json.dumps({
-                            "question_id": qid,
-                            "data_source": data["data_source"],
-                            "responses": data["responses"]
-                        }, ensure_ascii=False)
-                        f.write(json_line + '\n')
-
-            pbar.update(len(test_batch))
-
-        pbar.close()
-        print('Validation with Save: Generation end.')
-        print(f"Validation results saved to {output_path} (JSONL format)")
-
-        # 计算并返回指标
-        data_source_reward = defaultdict(list)
-        data_source_response_lengths = defaultdict(list)
-
-        for qid, data in results_by_question.items():
-            source = data['data_source']
-            for res in data['responses']:
-                data_source_reward[source].append(res['acc'])
-                data_source_response_lengths[source].append(res['tokens'])
-
-        metric_dict = {}
-        test_score_vals = []
-        test_length_vals = []
-
-        for data_source, rewards in data_source_reward.items():
-            mean_reward = np.mean(rewards)
-            metric_dict[f'val/test_score/{data_source}'] = mean_reward
-            test_score_vals.append(mean_reward)
-
-        for data_source, lengths in data_source_response_lengths.items():
-            mean_length = np.mean(lengths)
-            metric_dict[f'val/test_length/{data_source}'] = mean_length
-            test_length_vals.append(mean_length)
-
-        if test_score_vals:
-            metric_dict['result/avg_acc'] = np.mean(test_score_vals)
-        if test_length_vals:
-            metric_dict['result/avg_len'] = np.mean(test_length_vals)
-
-        return metric_dict
 
     def fit(self):
         """
@@ -505,6 +404,9 @@ class RayRLCRTrainer(RayPPOTrainer):
                         new_batch.batch["format_tensor"] = torch.tensor(reward_extra_infos_dict["format"])
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
 
+                        # compute brier score
+                        new_batch.batch["brier_score"] = 1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
+
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -610,19 +512,20 @@ class RayRLCRTrainer(RayPPOTrainer):
                             batch = batch[:traj_bsz]
 
                     # Log metrics
-                    metrics.update({"critic/original_rewards/mean": batch.batch['original_token_level_scores'].mean().item()})
-                    metrics.update({"rlcr/rewards/mean": batch.batch['token_level_scores'].mean().item()})
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
+                    metrics.update({"confidence_metrics/brier_score/mean": batch.batch['brier_score'].mean().item()})
+                    metrics.update({"confidence_metrics/brier_score/max": batch.batch['brier_score'].max().item()})
+                    metrics.update({"confidence_metrics/brier_score/min": batch.batch['brier_score'].min().item()})
                     
-                    # Compute average brier score for logging
-                    format_mask = batch.batch['format_tensor'].bool()
-                    if format_mask.any():
-                        acc_vals = batch.batch['acc_tensor'][format_mask]
-                        conf_vals = batch.batch['confidence_tensor'][format_mask]
-                        brier_scores = (acc_vals - conf_vals) ** 2
-                        metrics.update({"rlcr/avg_brier_score": brier_scores.mean().item()})
-                        metrics.update({"rlcr/avg_acc_reward": acc_vals.mean().item()})
-                        metrics.update({"rlcr/avg_confidence": conf_vals.mean().item()})
+                    # Compute AUROC and ECE for training batch
+                    acc_tensor_np = batch.batch['acc_tensor'].cpu().numpy()
+                    confidence_tensor_np = batch.batch['confidence_tensor'].cpu().numpy()
+                    
+                    train_auroc = compute_auroc(acc_tensor_np, confidence_tensor_np)
+                    train_ece = compute_ece(acc_tensor_np, confidence_tensor_np, n_bins=10)
+                    
+                    metrics.update({"confidence_metrics/auroc": train_auroc})
+                    metrics.update({"confidence_metrics/ece": train_ece})
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:

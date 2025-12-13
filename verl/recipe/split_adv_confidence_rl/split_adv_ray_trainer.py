@@ -25,6 +25,7 @@ from pprint import pprint
 import numpy as np
 import torch
 from tqdm import tqdm
+from sklearn.metrics import roc_auc_score
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
@@ -38,6 +39,70 @@ from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _tim
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 from verl.trainer.ppo import core_algos
+
+def compute_auroc(y_true, y_score):
+    """
+    Compute Area under ROC curve (AUROC).
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        
+    Returns:
+        AUROC score, or 0.0 if computation fails (e.g., only one class present)
+    """
+    try:
+        # Check if we have both classes
+        if len(np.unique(y_true)) < 2:
+            return 0.0
+        return roc_auc_score(y_true, y_score)
+    except Exception:
+        return 0.0
+
+def compute_ece(y_true, y_score, n_bins=10):
+    """
+    Compute Expected Calibration Error (ECE).
+    
+    ECE = sum(|Bm|/N * |acc(Bm) - conf(Bm)|)
+    where M is the number of bins, Bm is the set of samples in bin m, and N is the number of samples.
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        n_bins: Number of bins (default: 10)
+        
+    Returns:
+        ECE score
+    """
+    if len(y_true) == 0:
+        return 0.0
+    
+    # Bin the predictions
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
+    
+    ece = 0.0
+    n = len(y_true)
+    
+    for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+        # Find samples in this bin
+        # For the first bin, include the lower boundary (0)
+        if bin_lower == 0:
+            in_bin = (y_score >= bin_lower) & (y_score <= bin_upper)
+        else:
+            in_bin = (y_score > bin_lower) & (y_score <= bin_upper)
+        prop = np.mean(in_bin)
+        
+        if prop > 0:
+            # Accuracy in this bin
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            # Average confidence in this bin
+            avg_confidence_in_bin = np.mean(y_score[in_bin])
+            # Add to ECE
+            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop
+    
+    return ece
 
 def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False):
     if adv_estimator == "GRPO":
@@ -54,9 +119,24 @@ def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std
             # Original behavior: group by uid (prompt identifier)
             grouping_index = data.non_tensor_batch["uid"]
         
+        # Compute reward: when format=0, use the value of token_level_scores; otherwise use 1 - brier_score
+        # format_tensor is (batch_size,), brier_score is (batch_size,)
+        # We need to expand format_tensor to token level for token_level_rewards
+        format_tensor = data.batch["format_tensor"]  # (batch_size,)
+        brier_score = data.batch["brier_score"]  # (batch_size,)
+        
+        # Compute base reward: 1 - brier_score
+        base_reward = 1 - brier_score  # (batch_size,)
+        
+        # When format=0, set reward to the value of token_level_scores; otherwise use base_reward
+        sequence_reward = torch.where(format_tensor == 0, data.batch["token_level_scores"].sum(dim=-1), base_reward)
+        
+        # Expand to token level: (batch_size,) -> (batch_size, 1) for unsqueeze
+        token_level_rewards = sequence_reward.unsqueeze(-1)  # (batch_size, 1)
+        
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["brier_reward_tensor"].unsqueeze(-1),
+            token_level_rewards=token_level_rewards,
             response_mask=grpo_calculation_mask,
             index=grouping_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
@@ -85,7 +165,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         length_lst = []
         confidence_lst = []
         brier_score_lst = [] 
-        format_lst = [] # 0/1, 0: 错, 1: 对
+        format_lst = [] # 0/1, 0: incorrect, 1: correct
         
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -116,9 +196,9 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
             # evaluate using reward_function
             # for certain reward function (e.g. sandbox), the generation can overlap with reward
             reward_result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_acc = reward_result["reward_extra_info"]["acc"]  # 真实标签 y, 假设为 0 或 1
-            confidence = reward_result["reward_extra_info"]["confidence"] # 预测概率 p
-            format_scores_batch = reward_result["reward_extra_info"]["format"] # 格式，0 或 1
+            reward_acc = reward_result["reward_extra_info"]["acc"]  # True label y, assumed to be 0 or 1
+            confidence = reward_result["reward_extra_info"]["confidence"] # Predicted probability p
+            format_scores_batch = reward_result["reward_extra_info"]["format"] # Format, 0 or 1
         
             brier_scores = (np.array(confidence) - np.array(reward_acc))**2 
             
@@ -143,7 +223,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         confidences = np.concatenate(confidence_lst, axis=0)
 
         brier_scores = np.concatenate(brier_score_lst, axis=0) 
-        format_scores = np.concatenate(format_lst, axis=0) # 0 或 1
+        format_scores = np.concatenate(format_lst, axis=0) # 0 or 1
         
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -155,12 +235,12 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         for i in range(len(reward_acc)):
             data_source = data_sources[i]
             
-            # 准确率
+            # Accuracy
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_acc[i])
     
-            # 长度
+            # Length
             if data_source not in data_source_response_lengths:
                 data_source_response_lengths[data_source] = []
             data_source_response_lengths[data_source].append(lengths[i])
@@ -184,6 +264,8 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         test_confidence_vals = []
         test_brier_score_vals  = [] 
         test_format_acc_vals = []
+        test_auroc_vals = []
+        test_ece_vals = []
         
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
@@ -195,14 +277,12 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
             test_format_acc_vals.append(format_acc)
     
         for data_source, confidence in data_source_confidence.items():
-            # 这里只包含 format=1 的样本，计算平均值
-            mean_confidence = np.mean(confidence) if len(confidence) > 0 else 0 
+            mean_confidence = np.mean(confidence)
             metric_dict[f'val/test_confidence/{data_source}'] = mean_confidence
             test_confidence_vals.append(mean_confidence)
         
         for data_source, brier_terms in data_source_brier_scores.items():
-            # 这里只包含 format=1 的样本，计算平均值
-            mean_brier = np.mean(brier_terms) if len(brier_terms) > 0 else 0 
+            mean_brier = np.mean(brier_terms)
             metric_dict[f'val/test_brier_score/{data_source}'] = mean_brier
             test_brier_score_vals.append(mean_brier)
     
@@ -210,6 +290,22 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
             metric_dict[f'val/test_length/{data_source}'] = np.mean(lengths)
             test_length_vals.append(np.mean(lengths))
         
+        # Compute AUROC and ECE for each data source
+        for data_source in data_source_reward.keys():
+            # Get corresponding rewards (acc) and confidences for this data source
+            acc_values = np.array(data_source_reward[data_source])
+            conf_values = np.array(data_source_confidence[data_source])
+            
+            # Compute AUROC
+            auroc = compute_auroc(acc_values, conf_values)
+            metric_dict[f'val/confidence_metrics/auroc/{data_source}'] = auroc
+            test_auroc_vals.append(auroc)
+            
+            # Compute ECE
+            ece = compute_ece(acc_values, conf_values, n_bins=10)
+            metric_dict[f'val/confidence_metrics/ece/{data_source}'] = ece
+            test_ece_vals.append(ece)
+       
         metric_dict['result/avg_acc'] = np.mean(test_score_vals)
         metric_dict['result/avg_len'] = np.mean(test_length_vals)
         
@@ -217,6 +313,8 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
     
         metric_dict['result/avg_confidence'] = np.mean(test_confidence_vals)
         metric_dict['result/avg_brier_score'] = np.mean(test_brier_score_vals)
+        metric_dict['result/avg_auroc'] = np.mean(test_auroc_vals) if len(test_auroc_vals) > 0 else 0.0
+        metric_dict['result/avg_ece'] = np.mean(test_ece_vals) if len(test_ece_vals) > 0 else 0.0
           
         return metric_dict
 
@@ -377,7 +475,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
 
                         # compute brier score
-                        new_batch.batch["brier_reward_tensor"] =  1 - 1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
+                        new_batch.batch["brier_score"] =  1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
@@ -443,7 +541,19 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                             batch = batch[:traj_bsz]
 
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
-                    metrics.update({"brier/mean": batch.batch['brier_reward_tensor'].mean().item()})
+                    metrics.update({"confidence_metrics/brier_score/mean": batch.batch['brier_score'].mean().item()})
+                    metrics.update({"confidence_metrics/brier_score/max": batch.batch['brier_score'].max().item()})
+                    metrics.update({"confidence_metrics/brier_score/min": batch.batch['brier_score'].min().item()})
+                    
+                    # Compute AUROC and ECE for training batch
+                    acc_tensor_np = batch.batch['acc_tensor'].cpu().numpy()
+                    confidence_tensor_np = batch.batch['confidence_tensor'].cpu().numpy()
+                    
+                    train_auroc = compute_auroc(acc_tensor_np, confidence_tensor_np)
+                    train_ece = compute_ece(acc_tensor_np, confidence_tensor_np, n_bins=10)
+                    
+                    metrics.update({"confidence_metrics/auroc": train_auroc})
+                    metrics.update({"confidence_metrics/ece": train_ece})
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:

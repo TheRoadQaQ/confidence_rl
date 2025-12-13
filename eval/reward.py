@@ -67,7 +67,7 @@ def gen_correctness_reward(completions, answer, **kwargs):
 
     return matches
 
-def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=0.0):
+def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=-1.0):
     """
     根据 solution_str (模型输出) 和 ground_truth (标准答案) 计算奖励。
     
