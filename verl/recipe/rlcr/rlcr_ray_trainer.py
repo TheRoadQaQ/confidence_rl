@@ -13,7 +13,10 @@
 # limitations under the License.
 """
 FSDP PPO Trainer with Ray-based single controller.
-This trainer supports model-agonistic model initialization with huggingface
+This trainer implements RLCR: Reward = acc_reward - brier_score
+where:
+- acc_reward: whether the answer is correct (0 or 1)
+- brier_score: (acc - confidence)^2
 """
 import os
 import uuid
@@ -38,33 +41,20 @@ from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _tim
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 
-class RayConstraintTrainer(RayPPOTrainer):
+class RayRLCRTrainer(RayPPOTrainer):
     """
+    RLCR Trainer: Reward Learning with Calibration Regularization.
+    
+    Reward formula: reward = acc_reward - brier_score
+    where:
+    - acc_reward: whether the answer is correct (0 or 1)
+    - brier_score: (acc - confidence)^2
+    
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # Initialize constraint manager if enabled
-        self.use_constraints = self.config.algorithm.get("use_constraints", False)
-        print(f"\033[93mDAPOTrainer: use_constraints = {self.use_constraints}\033[0m")
-        self.constraint_manager = None
-        
-        if self.use_constraints:
-            from .constraint_reward_manager import CalashRewardManager
-            
-            constraint_config = self.config.algorithm.constraint_config
-            self.constraint_manager = CalashRewardManager(
-                target_brier_score=constraint_config.target_brier_score,
-                lambda_init=constraint_config.lambda_init,
-                lambda_lr=constraint_config.lambda_lr,
-                lambda_max=constraint_config.lambda_max,
-                lambda_min=constraint_config.lambda_min,
-                constraint_type=constraint_config.constraint_type,
-            )
-            if self.constraint_manager is not None:
-                print("\033[91mLoad ConstrainedRewardManager Successful\033[0m")
 
     def _validate(self):
         print("Validation: Generation Begin.")
@@ -73,18 +63,16 @@ class RayConstraintTrainer(RayPPOTrainer):
         data_source_lst = []
         length_lst = []
         confidence_lst = []
-        # 🌟 新增 Brier score 相关的列表
         brier_score_lst = [] 
         format_lst = [] # 0/1, 0: 错, 1: 对
         
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
-            # test_batch = test_batch.to('cuda')
         
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
-        
+            
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
@@ -95,34 +83,32 @@ class RayConstraintTrainer(RayPPOTrainer):
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
-        
+            
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-        
+            
             test_batch = test_batch.union(test_output_gen_batch)
             # evaluate using reward_function
-            # for certain reward function (e.g. sandbox), the generation can overlap with reward
             reward_result = self.val_reward_fn(test_batch, return_dict=True)
             reward_acc = reward_result["reward_extra_info"]["acc"]  # 真实标签 y, 假设为 0 或 1
             confidence = reward_result["reward_extra_info"]["confidence"] # 预测概率 p
             format_scores_batch = reward_result["reward_extra_info"]["format"] # 格式，0 或 1
         
-            # 🌟 Brier Score 计算： (p - y)^2
+            # Brier Score 计算： (p - y)^2
             brier_scores = (np.array(confidence) - np.array(reward_acc))**2 
             
             # obtain response length
-            def obtain_reponse_length(output_batch):
+            def obtain_response_length(output_batch):
                 prompt_length = output_batch.batch['prompts'].shape[-1]
                 response_length = output_batch.batch['attention_mask'][:,prompt_length:].sum(1).numpy()
                 return response_length
                 
-            length_lst.append(obtain_reponse_length(test_output_gen_batch))
+            length_lst.append(obtain_response_length(test_output_gen_batch))
             reward_acc_lst.append(reward_acc)
             confidence_lst.append(confidence)
-            # 🌟 收集 Brier score 项
             brier_score_lst.append(brier_scores)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * len(reward_acc)))
             format_lst.append(format_scores_batch)
@@ -134,7 +120,6 @@ class RayConstraintTrainer(RayPPOTrainer):
         data_sources = np.concatenate(data_source_lst, axis=0)
         lengths = np.concatenate(length_lst, axis=0)
         confidences = np.concatenate(confidence_lst, axis=0)
-        # 🌟 合并 Brier score 项
         brier_scores = np.concatenate(brier_score_lst, axis=0) 
         format_scores = np.concatenate(format_lst, axis=0) # 0 或 1
         
@@ -146,7 +131,6 @@ class RayConstraintTrainer(RayPPOTrainer):
         data_source_response_lengths = {}
         data_source_confidence = {}
         data_source_brier_scores = {}
-        # 🌟 新增 format 指标字典
         data_source_format_scores = {}
         
         for i in range(len(reward_acc)):
@@ -162,19 +146,19 @@ class RayConstraintTrainer(RayPPOTrainer):
                 data_source_response_lengths[data_source] = []
             data_source_response_lengths[data_source].append(lengths[i])
     
-            # 🌟 格式分数
+            # 格式分数
             if data_source not in data_source_format_scores:
                 data_source_format_scores[data_source] = []
             data_source_format_scores[data_source].append(format_scores[i])
     
-            # 🌟 仅收集格式正确的样本的置信度/Brier Score
+            # 仅收集格式正确的样本的置信度/Brier Score
             if format_scores[i] == 1:
                 # 置信度
                 if data_source not in data_source_confidence:
                     data_source_confidence[data_source] = []
                 data_source_confidence[data_source].append(confidences[i])
                 
-                # 🌟 Brier Score
+                # Brier Score
                 if data_source not in data_source_brier_scores:
                     data_source_brier_scores[data_source] = []
                 data_source_brier_scores[data_source].append(brier_scores[i])
@@ -183,32 +167,28 @@ class RayConstraintTrainer(RayPPOTrainer):
         metric_dict = {}
         test_score_vals = []
         test_length_vals = []
-        # 🌟 仅格式正确的置信度/Brier Score
         test_confidence_vals_format_correct = []
         test_brier_score_vals_format_correct = [] 
-        # 🌟 格式准确率
         test_format_acc_vals = []
         
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
             test_score_vals.append(np.mean(rewards))
     
-        # 🌟 计算并添加按数据源分组的格式准确率
+        # 计算并添加按数据源分组的格式准确率
         for data_source, formats in data_source_format_scores.items():
             format_acc = np.mean(formats)
             metric_dict[f'val/format_acc/{data_source}'] = format_acc
             test_format_acc_vals.append(format_acc)
     
-        # 🌟 计算并添加按数据源分组的格式正确样本的平均置信度
+        # 计算并添加按数据源分组的格式正确样本的平均置信度
         for data_source, confidence in data_source_confidence.items():
-            # 这里只包含 format=1 的样本，计算平均值
             mean_confidence = np.mean(confidence) if len(confidence) > 0 else 0 
             metric_dict[f'val/test_confidence_format_correct/{data_source}'] = mean_confidence
             test_confidence_vals_format_correct.append(mean_confidence)
         
-        # 🌟 计算并添加按数据源分组的格式正确样本的平均 Brier Score
+        # 计算并添加按数据源分组的格式正确样本的平均 Brier Score
         for data_source, brier_terms in data_source_brier_scores.items():
-            # 这里只包含 format=1 的样本，计算平均值
             mean_brier = np.mean(brier_terms) if len(brier_terms) > 0 else 0 
             metric_dict[f'val/test_brier_score_format_correct/{data_source}'] = mean_brier
             test_brier_score_vals_format_correct.append(mean_brier)
@@ -217,16 +197,14 @@ class RayConstraintTrainer(RayPPOTrainer):
             metric_dict[f'val/test_length/{data_source}'] = np.mean(lengths)
             test_length_vals.append(np.mean(lengths))
         
-        # --- 总结指标 ---
-        
+        # 总结指标
         metric_dict['result/avg_acc'] = np.mean(test_score_vals)
         metric_dict['result/avg_len'] = np.mean(test_length_vals)
         
-        # 🌟 总体格式准确率
+        # 总体格式准确率
         metric_dict['result/avg_format_acc'] = np.mean(test_format_acc_vals)
     
-        # 🌟 仅格式正确的样本的总体平均置信度/Brier Score
-        # 使用 format_mask 过滤后的样本计算总体平均值
+        # 仅格式正确的样本的总体平均置信度/Brier Score
         confidences_format_correct = confidences[format_mask]
         brier_scores_format_correct = brier_scores[format_mask]
         
@@ -243,14 +221,8 @@ class RayConstraintTrainer(RayPPOTrainer):
         """
         print("Validation with Save: Generation Begin.")
 
-        # 修改数据结构以存储 data_source
-        # results_by_question 的结构将变为:
-        # {
-        #   "qid1": {"data_source": "source_A", "responses": [{"response": "...", "acc": 1.0, "tokens": 123}, ...]},
-        #   "qid2": {"data_source": "source_B", "responses": [{"response": "...", "acc": 0.0, "tokens": 456}, ...]}
-        # }
         results_by_question = {}
-        processed_qids = set()  # 存储已处理的 question_ids
+        processed_qids = set()
 
         # 检查输出文件是否存在，如果存在则读取已处理的 question_ids
         if os.path.exists(output_path):
@@ -262,7 +234,6 @@ class RayConstraintTrainer(RayPPOTrainer):
                         data = json.loads(line.strip())
                         qid = data["question_id"]
                         processed_qids.add(qid)
-                        # 将已有数据加载到内存中，用于后续的指标计算
                         results_by_question[qid] = {
                             "data_source": data["data_source"],
                             "responses": data["responses"]
@@ -271,12 +242,11 @@ class RayConstraintTrainer(RayPPOTrainer):
                         continue
             print(f"Found {len(processed_qids)} already processed question_ids.")
 
-        # Calculate total samples for progress bar (excluding already processed ones)
+        # Calculate total samples for progress bar
         total_samples = 0
         skipped_samples = 0
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
-            # 检查这个 batch 中有多少需要处理
             if 'question_id' in test_batch.non_tensor_batch:
                 batch_qids = test_batch.non_tensor_batch.get('question_id')
                 unprocessed_in_batch = sum(1 for qid in batch_qids if qid not in processed_qids)
@@ -287,7 +257,6 @@ class RayConstraintTrainer(RayPPOTrainer):
 
         print(f"Total samples to process: {total_samples} (skipping {skipped_samples} already processed)")
 
-        # Create progress bar with actual samples to process
         pbar = tqdm(total=total_samples, desc="Validating samples")
 
         for test_data in self.val_dataloader:
@@ -300,14 +269,11 @@ class RayConstraintTrainer(RayPPOTrainer):
             # 检查 batch 中的 question_ids，过滤出需要处理的样本
             if 'question_id' in test_batch.non_tensor_batch:
                 batch_qids = test_batch.non_tensor_batch.get('question_id')
-                # 找出需要处理的样本索引
                 indices_to_process = [i for i, qid in enumerate(batch_qids) if qid not in processed_qids]
 
                 if not indices_to_process:
-                    # 整个 batch 都已处理过，跳过
                     continue
 
-                # 只保留需要处理的样本
                 test_batch = test_batch[indices_to_process]
 
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
@@ -331,18 +297,15 @@ class RayConstraintTrainer(RayPPOTrainer):
             reward_result = self.val_reward_fn(final_batch, return_dict=True)
             accuracies = reward_result["reward_extra_info"]["acc"]
 
-            # --- 新增: 提取 question_id 和 data_source ---
             question_ids = final_batch.non_tensor_batch.get('question_id')
-            # 假设每个样本都有 data_source，如果没有则提供默认值 'unknown'
             data_sources = final_batch.non_tensor_batch.get('data_source', ['unknown'] * len(question_ids))
 
             response_ids = output_gen_batch.batch['responses']
 
-            # 计算实际的 token 长度（参考 obtain_reponse_length）
             prompt_length = output_gen_batch.batch['prompts'].shape[-1]
             response_lengths = output_gen_batch.batch['attention_mask'][:, prompt_length:].sum(1).numpy()
 
-            new_results_for_save = {}  # 存储这个 batch 的新结果
+            new_results_for_save = {}
 
             for i in range(len(question_ids)):
                 qid = question_ids[i]
@@ -352,27 +315,22 @@ class RayConstraintTrainer(RayPPOTrainer):
 
                 response_text = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
 
-                # --- 修改: 更新数据保存结构 ---
-                # 如果是第一次遇到这个 qid，则初始化其条目
                 if qid not in results_by_question:
                     results_by_question[qid] = {
                         "data_source": source,
                         "responses": []
                     }
-                    # 标记为需要保存的新结果
                     new_results_for_save[qid] = {
                         "data_source": source,
                         "responses": []
                     }
 
-                # 将结果添加到字典中，包含 tokens 字段
                 results_by_question[qid]["responses"].append({
                     "response": response_text.strip(),
                     "acc": float(acc),
                     "tokens": token_length
                 })
 
-                # 如果是新结果，也添加到待保存列表
                 if qid in new_results_for_save:
                     new_results_for_save[qid]["responses"].append({
                         "response": response_text.strip(),
@@ -380,7 +338,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                         "tokens": token_length
                     })
 
-            # 实时追加新结果到文件（避免程序中断丢失数据）
+            # 实时追加新结果到文件
             if new_results_for_save:
                 with open(output_path, 'a', encoding='utf-8') as f:
                     for qid, data in new_results_for_save.items():
@@ -391,44 +349,36 @@ class RayConstraintTrainer(RayPPOTrainer):
                         }, ensure_ascii=False)
                         f.write(json_line + '\n')
 
-            # Update progress bar
             pbar.update(len(test_batch))
 
         pbar.close()
         print('Validation with Save: Generation end.')
-
-        # 不再需要在最后保存，因为已经实时保存了
         print(f"Validation results saved to {output_path} (JSONL format)")
 
-        # --- 修改: 计算并返回指标以用于日志记录 (与 _validate 逻辑对齐) ---
+        # 计算并返回指标
         data_source_reward = defaultdict(list)
         data_source_response_lengths = defaultdict(list)
 
-        # 从已保存的结果中收集数据
         for qid, data in results_by_question.items():
             source = data['data_source']
             for res in data['responses']:
                 data_source_reward[source].append(res['acc'])
-                # 使用实际的 token 长度而不是字符串长度
                 data_source_response_lengths[source].append(res['tokens'])
 
         metric_dict = {}
         test_score_vals = []
         test_length_vals = []
 
-        # 计算每个 data_source 的平均准确率
         for data_source, rewards in data_source_reward.items():
             mean_reward = np.mean(rewards)
             metric_dict[f'val/test_score/{data_source}'] = mean_reward
             test_score_vals.append(mean_reward)
 
-        # 计算每个 data_source 的平均长度
         for data_source, lengths in data_source_response_lengths.items():
             mean_length = np.mean(lengths)
             metric_dict[f'val/test_length/{data_source}'] = mean_length
             test_length_vals.append(mean_length)
 
-        # 计算总体平均准确率和长度
         if test_score_vals:
             metric_dict['result/avg_acc'] = np.mean(test_score_vals)
         if test_length_vals:
@@ -458,11 +408,8 @@ class RayConstraintTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
-        if self.global_steps != 0 and self.use_constraints:
-            self.constraint_manager.load_state(os.path.join(self.config.trainer.default_local_dir,f"{self.global_steps}_constraint_manager_state.pt"))
 
         # perform validation before training
-        # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             if self.config.trainer.get("val_only", False):
                 print(f"Validation only, val_save_path: {self.config.trainer.val_save_path}")
@@ -534,8 +481,6 @@ class RayConstraintTrainer(RayPPOTrainer):
 
                     with _timer("reward", timing_raw):
                         # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
                         if self.use_rm:
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(new_batch)
@@ -552,7 +497,10 @@ class RayConstraintTrainer(RayPPOTrainer):
                             reward_tensor = self.reward_fn(new_batch)
                             reward_extra_infos_dict = {}
 
-                        new_batch.batch["token_level_scores"] = reward_tensor
+                        # Store original reward for logging
+                        new_batch.batch["original_token_level_scores"] = reward_tensor.clone()
+                        
+                        # Extract acc and confidence
                         new_batch.batch["confidence_tensor"] = torch.tensor(reward_extra_infos_dict["confidence"])
                         new_batch.batch["format_tensor"] = torch.tensor(reward_extra_infos_dict["format"])
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
@@ -561,46 +509,67 @@ class RayConstraintTrainer(RayPPOTrainer):
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # Compute response_mask before applying constraints
+                        # Compute response_mask
                         if "response_mask" not in new_batch.batch:
                             new_batch.batch["response_mask"] = compute_response_mask(new_batch)
 
-                        #breakpoint()
-
-                        # Apply Lagrangian constraints if enabled
-                        if self.use_constraints and self.constraint_manager is not None:
-
-                            new_batch.batch["original_token_level_scores"] = new_batch.batch["token_level_scores"].clone()
-
-                            constraint_result = self.constraint_manager.compute_constrained_reward(
-                                new_batch,
-                                return_dict=True
-                            )
+                        # Apply RLCR reward formula: reward = acc_reward - brier_score
+                        # acc_reward: whether the answer is correct (0 or 1)
+                        # brier_score: (acc - confidence)^2
+                        batch_size = len(reward_tensor)
+                        response_mask = new_batch.batch["response_mask"]
+                        
+                        # Clone reward tensor to preserve original values for non-last tokens
+                        rlcr_reward_tensor = reward_tensor.clone()
+                        
+                        for i in range(batch_size):
+                            valid_response_length = int(torch.sum(response_mask[i]).item())
                             
-                            # Update rewards with constrained values
-                            new_batch.batch["token_level_scores"] = constraint_result["reward_tensor"]
-                            metrics.update({"calash/num_format_errors_batch": constraint_result["reward_extra_info"]["calash/num_format_errors_batch"]})
+                            # Skip samples with no response
+                            if valid_response_length == 0:
+                                continue
                             
-                            # Update metrics with constraint info
-                            constraint_metrics = self.constraint_manager.get_metrics()
-                            print(f"\033[92mConstraint metrics: {list(constraint_metrics.keys())}\033[0m")
-                            metrics.update(constraint_metrics)
+                            last_token_idx = valid_response_length - 1
+                            
+                            # Get acc and confidence for this sample
+                            acc_i = new_batch.batch["acc_tensor"][i].item()  # 0 or 1
+                            conf_i = new_batch.batch["confidence_tensor"][i].item()  # confidence value
+                            format_i = new_batch.batch["format_tensor"][i].item()  # 0 or 1
+                            
+                            # Only apply RLCR formula if format is correct
+                            if format_i:
+                                # acc_reward: whether the answer is correct (0 or 1)
+                                acc_reward = acc_i
+                                
+                                # brier_score: (acc - confidence)^2
+                                brier_score = (acc_i - conf_i) ** 2
+                                
+                                # RLCR reward: acc_reward - brier_score
+                                rlcr_reward = acc_reward - brier_score
+                                
+                                # Apply reward only at the last token
+                                rlcr_reward_tensor[i, last_token_idx] = torch.clamp(
+                                    torch.tensor(rlcr_reward), min=-1.0, max=1.0
+                                )
+                            else:
+                                # If format is incorrect, keep original reward (usually FORMAT_PENALTY)
+                                rlcr_reward_tensor[i, last_token_idx] = reward_tensor[i, last_token_idx]
 
+                        # Update token_level_scores with RLCR reward
+                        new_batch.batch["token_level_scores"] = rlcr_reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             new_batch, kl_metrics = apply_kl_penalty(new_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)  # TODO: This will be cleared if we use multiple genenration batches
+                            metrics.update(kl_metrics)
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
-                    else:  # NOTE: When prompts after filtering is less than train batch size,
-                        # we skip to the next generation batch
+                    else:
                         metric_name = self.config.algorithm.filter_groups.metric
                         if metric_name == "seq_final_reward":
-                            # Turn to numpy for easier filtering
                             new_batch.non_tensor_batch["seq_final_reward"] = new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
                         elif metric_name == "seq_reward":
                             new_batch.non_tensor_batch["seq_reward"] = new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
@@ -640,19 +609,26 @@ class RayConstraintTrainer(RayPPOTrainer):
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
 
-                    #breakpoint()
+                    # Log metrics
                     metrics.update({"critic/original_rewards/mean": batch.batch['original_token_level_scores'].mean().item()})
+                    metrics.update({"rlcr/rewards/mean": batch.batch['token_level_scores'].mean().item()})
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
+                    
+                    # Compute average brier score for logging
+                    format_mask = batch.batch['format_tensor'].bool()
+                    if format_mask.any():
+                        acc_vals = batch.batch['acc_tensor'][format_mask]
+                        conf_vals = batch.batch['confidence_tensor'][format_mask]
+                        brier_scores = (acc_vals - conf_vals) ** 2
+                        metrics.update({"rlcr/avg_brier_score": brier_scores.mean().item()})
+                        metrics.update({"rlcr/avg_acc_reward": acc_vals.mean().item()})
+                        metrics.update({"rlcr/avg_confidence": conf_vals.mean().item()})
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
                     # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
@@ -722,13 +698,9 @@ class RayConstraintTrainer(RayPPOTrainer):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
 
-                            if self.use_constraints:                            
-                                self.constraint_manager.save_state(os.path.join(self.config.trainer.default_local_dir,f"{self.global_steps}_constraint_manager_state.pt"))
-
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 timing_raw = defaultdict(float)  # clear timing
@@ -738,7 +710,6 @@ class RayConstraintTrainer(RayPPOTrainer):
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
 
-                # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
@@ -748,3 +719,4 @@ class RayConstraintTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+

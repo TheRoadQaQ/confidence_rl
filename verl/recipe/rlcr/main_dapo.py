@@ -21,11 +21,10 @@ import ray
 
 from verl.trainer.ppo.reward import get_custom_reward_fn
 
-from .constraint_ray_trainer import RayConstraintTrainer
-from .constraint_ray_trainer_2_adv import RayConstraintTrainer
+from .rlcr_ray_trainer import RayRLCRTrainer
 
 
-@hydra.main(config_path="config", config_name="constraint_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="rlcr_trainer", version_base=None)
 def main(config):
     run_ppo(config)
 
@@ -156,7 +155,7 @@ class TaskRunner:
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        trainer = RayConstraintTrainer(
+        trainer = RayRLCRTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -173,3 +172,4 @@ class TaskRunner:
 
 if __name__ == "__main__":
     main()
+

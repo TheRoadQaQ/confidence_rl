@@ -25,4 +25,5 @@ algorithm:
     max_num_gen_batches: 0 # Non-positive values mean no upper limit
 
 trainer:
-  project_name: verl-split-adv-confidence
+  project_name: verl-rlcr
+
