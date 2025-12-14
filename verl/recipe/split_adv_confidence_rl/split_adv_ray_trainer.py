@@ -15,9 +15,7 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-import os
 import uuid
-import json
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
@@ -375,9 +373,6 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
-        if self.global_steps != 0 and self.use_constraints:
-            self.constraint_manager.load_state(os.path.join(self.config.trainer.default_local_dir,f"{self.global_steps}_constraint_manager_state.pt"))
-
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -481,7 +476,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # Compute response_mask before applying constraints
+                        # Compute response_mask
                         if "response_mask" not in new_batch.batch:
                             new_batch.batch["response_mask"] = compute_response_mask(new_batch)
 
@@ -653,9 +648,6 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
-
-                            if self.use_constraints:                            
-                                self.constraint_manager.save_state(os.path.join(self.config.trainer.default_local_dir,f"{self.global_steps}_constraint_manager_state.pt"))
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
