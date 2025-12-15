@@ -145,7 +145,7 @@ def compute_accuracy_advantage(data: DataProto, adv_estimator, norm_adv_by_std_i
       
         grouping_index = data.non_tensor_batch["uid"]
 
-        token_level_rewards = data.batch["accuracy_reward"]
+        token_level_rewards = data.batch["accuracy_reward"].unsqueeze(-1) 
         
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
@@ -632,12 +632,9 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                         group_confidence_adv_by_acc = self.config.algorithm.get("group_confidence_adv_by_acc", False)
                         
-                        acc_batch = compute_advantage(
+                        acc_batch = compute_accuracy_advantage(
                             acc_batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            adv_estimator="GRPO",
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         )
 
