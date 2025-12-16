@@ -497,51 +497,16 @@ class RayRLCRTrainer(RayPPOTrainer):
                         # Compute response_mask
                         if "response_mask" not in new_batch.batch:
                             new_batch.batch["response_mask"] = compute_response_mask(new_batch)
+                        
+                        acc_reward = new_batch.batch["acc_tensor"]
+                        conf_reward = 1 - new_batch.batch["brier_score"]
+                        format_reward = new_batch.batch["format_tensor"]
 
-                        # Apply RLCR reward formula: reward = acc_reward - brier_score
-                        # acc_reward: whether the answer is correct (0 or 1)
-                        # brier_score: (acc - confidence)^2
-                        batch_size = len(reward_tensor)
-                        response_mask = new_batch.batch["response_mask"]
-                        
-                        # Clone reward tensor to preserve original values for non-last tokens
-                        rlcr_reward_tensor = reward_tensor.clone()
-                        
-                        for i in range(batch_size):
-                            valid_response_length = int(torch.sum(response_mask[i]).item())
-                            
-                            # Skip samples with no response
-                            if valid_response_length == 0:
-                                continue
-                            
-                            last_token_idx = valid_response_length - 1
-                            
-                            # Get acc and confidence for this sample
-                            acc_i = new_batch.batch["acc_tensor"][i].item()  # 0 or 1
-                            conf_i = new_batch.batch["confidence_tensor"][i].item()  # confidence value
-                            format_i = new_batch.batch["format_tensor"][i].item()  # 0 or 1
-                            
-                            # Only apply RLCR formula if format is correct
-                            if format_i:
-                                # acc_reward: whether the answer is correct (0 or 1)
-                                acc_reward = acc_i
-                                
-                                # brier_score: (acc - confidence)^2
-                                brier_score = (acc_i - conf_i) ** 2
-                                
-                                # RLCR reward: acc_reward - brier_score
-                                rlcr_reward = acc_reward - brier_score
-                                
-                                # Apply reward only at the last token
-                                rlcr_reward_tensor[i, last_token_idx] = torch.clamp(
-                                    torch.tensor(rlcr_reward), min=-1.0, max=1.0
-                                )
-                            else:
-                                # If format is incorrect, keep original reward (usually FORMAT_PENALTY)
-                                rlcr_reward_tensor[i, last_token_idx] = reward_tensor[i, last_token_idx]
+                        format_reward_weight = self.config.algorithm.get("format_reward_weight", 0.0)
+                        rlcr_reward = acc_reward + conf_reward + format_reward_weight * format_reward
 
                         # Update token_level_scores with RLCR reward
-                        new_batch.batch["token_level_scores"] = rlcr_reward_tensor
+                        new_batch.batch["token_level_scores"] = rlcr_reward.unsqueeze(-1)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -550,49 +515,7 @@ class RayRLCRTrainer(RayPPOTrainer):
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
-                    if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
-                    else:
-                        metric_name = self.config.algorithm.filter_groups.metric
-                        if metric_name == "seq_final_reward":
-                            new_batch.non_tensor_batch["seq_final_reward"] = new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
-                        elif metric_name == "seq_reward":
-                            new_batch.non_tensor_batch["seq_reward"] = new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-
-                        # Collect the sequence reward for each trajectory
-                        prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name]):
-                            prompt_uid2metric_vals[uid].append(metric_val)
-
-                        prompt_uid2metric_std = {}
-                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
-
-                        kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
-                        num_prompt_in_batch += len(kept_prompt_uids)
-
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_prompt_uids:
-                                kept_traj_idxs.append(idx)
-
-                        new_batch = new_batch[kept_traj_idxs]
-                        batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
-
-                        prompt_bsz = self.config.data.train_batch_size
-                        if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
-                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
-                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
-                                print(f"{num_gen_batches=}. Keep generating...")
-                                progress_bar.update(1)
-                                continue
-                            else:
-                                raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
-                        else:
-                            # Align the batch
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = batch[:traj_bsz]
 
                     # Log metrics
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})

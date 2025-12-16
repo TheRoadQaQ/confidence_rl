@@ -102,17 +102,19 @@ def compute_ece(y_true, y_score, n_bins=10):
     
     return ece
 
-def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False, confidence_adv_weight=1.0):
+def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False):
     if adv_estimator == "GRPO":
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]
         
         # Determine grouping index: by acc values or by uid (prompt)
         if group_by_acc:
-            # Group by acc values: convert acc_tensor to numpy array of strings for grouping
+            # First Group by uid
+            # Then Group by acc values
+            grouping_index = data.non_tensor_batch["uid"]
             acc_values = data.batch["acc_tensor"].cpu().numpy()
-            # Convert to string array for use as index (ensures hashable keys)
-            grouping_index = np.array([str(acc) for acc in acc_values], dtype=object)
+            
+
         else:
             # Original behavior: group by uid (prompt identifier)
             grouping_index = data.non_tensor_batch["uid"]
@@ -131,7 +133,7 @@ def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std
             index=grouping_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-        data.batch["advantages"] = advantages * confidence_adv_weight
+        data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
         raise NotImplementedError
@@ -567,8 +569,8 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                     metrics.update({"confidence_metrics/auroc": train_auroc})
                     metrics.update({"confidence_metrics/ece": train_ece})
 
-                    batch.batch["confidence_reward"] = 1 - batch.batch["brier_score"] + batch.batch["format_tensor"]
-                    batch.batch["accuracy_reward"] = batch.batch["acc_tensor"] + batch.batch["format_tensor"]
+                    batch.batch["confidence_reward"] = (1 - batch.batch["brier_score"]) + self.config.algorithm.get("format_reward_weight", 0.0) * batch.batch["format_tensor"]
+                    batch.batch["accuracy_reward"] = batch.batch["acc_tensor"] + self.config.algorithm.get("format_reward_weight", 0.0) * batch.batch["format_tensor"]
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:
@@ -643,7 +645,6 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                             adv_estimator="GRPO",
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             group_by_acc=group_confidence_adv_by_acc,
-                            confidence_adv_weight=self.config.algorithm.get("confidence_adv_weight", 1.0),
                         )
 
                         # TODO: concat acc and confidence batch in a better way
