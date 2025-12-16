@@ -102,7 +102,7 @@ def compute_ece(y_true, y_score, n_bins=10):
     
     return ece
 
-def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False):
+def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False, confidence_weight=1.0):
     if adv_estimator == "GRPO":
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]
@@ -133,7 +133,7 @@ def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std
             index=grouping_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-        data.batch["advantages"] = advantages
+        data.batch["advantages"] = advantages * confidence_weight
         data.batch["returns"] = returns
     else:
         raise NotImplementedError
@@ -645,6 +645,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                             adv_estimator="GRPO",
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             group_by_acc=group_confidence_adv_by_acc,
+                            confidence_weight=self.config.algorithm.get("confidence_weight", 1.0)
                         )
 
                         # TODO: concat acc and confidence batch in a better way
